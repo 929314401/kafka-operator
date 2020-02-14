@@ -718,9 +718,8 @@ func (r *Reconciler) reconcileKafkaPvc(log logr.Logger, desiredPvc *corev1.Persi
 		}
 		err = k8sutil.UpdateBrokerStatus(r.Client, []string{desiredPvc.Labels["brokerId"]},
 			// get pods with brokerid, then run this line below
-			r.KafkaCluster, v1beta1.VolumeState{
-				MountPath:                desiredPvc.Annotations["mountPath"],
-				CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRequired,
+			r.KafkaCluster, map[string]v1beta1.VolumeState{
+			desiredPvc.Annotations["mountPath"]: {CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRequired},
 			}, log)
 		if err != nil {
 			return err

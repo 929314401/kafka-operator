@@ -22,21 +22,19 @@ import (
 	"time"
 
 	"emperror.dev/errors"
-	"github.com/banzaicloud/kafka-operator/api/v1beta1"
-	"github.com/banzaicloud/kafka-operator/pkg/errorfactory"
-	"github.com/banzaicloud/kafka-operator/pkg/k8sutil"
-	"github.com/banzaicloud/kafka-operator/pkg/resources/kafka"
-	"github.com/banzaicloud/kafka-operator/pkg/scale"
-	"github.com/banzaicloud/kafka-operator/pkg/util"
-	ccutils "github.com/banzaicloud/kafka-operator/pkg/util/cruisecontrol"
 	"github.com/go-logr/logr"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	"github.com/banzaicloud/kafka-operator/api/v1beta1"
+	"github.com/banzaicloud/kafka-operator/pkg/errorfactory"
+	"github.com/banzaicloud/kafka-operator/pkg/k8sutil"
+	"github.com/banzaicloud/kafka-operator/pkg/scale"
+	ccutils "github.com/banzaicloud/kafka-operator/pkg/util/cruisecontrol"
 
 	apiErrors "k8s.io/apimachinery/pkg/api/errors"
 
@@ -51,7 +49,6 @@ type CruiseControlReconciler struct {
 	Log logr.Logger
 }
 
-// +kubebuilder:rbac:groups=kafka.banzaicloud.io,resources=kafkaCluster,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kafka.banzaicloud.io,resources=kafkaCluster/status,verbs=get;update;patch
 
 func (r *CruiseControlReconciler) Reconcile(request ctrl.Request) (ctrl.Result, error) {
@@ -74,150 +71,124 @@ func (r *CruiseControlReconciler) Reconcile(request ctrl.Request) (ctrl.Result, 
 
 	log.V(1).Info("Reconciling")
 
-	var brokersWithDownscaleRequired []string
-
+	// TODO beatify this (baluchicken)
+	// Check if CC has a running task it is based on CR status
+	OUTERLOOP:
 	for brokerId, brokerStatus := range instance.Status.BrokersState {
-		var err error
-
-		if brokerStatus.GracefulActionState.CruiseControlState.IsUpscale() {
-			err = r.handlePodAddCCTask(instance, brokerId, brokerStatus, log)
-		} else if brokerStatus.GracefulActionState.CruiseControlState.IsDownscale() {
-			if brokerStatus.GracefulActionState.CruiseControlState == v1beta1.GracefulDownscaleRunning {
-				err = r.checkCCTaskState(instance, []string{brokerId}, brokerStatus, v1beta1.GracefulDownscaleSucceeded, log)
-				if err != nil {
-					return requeueWithError(log, err.Error(), err)
-				}
-			} else if brokerStatus.GracefulActionState.CruiseControlState == v1beta1.GracefulDownscaleRequired {
-				brokersWithDownscaleRequired = append(brokersWithDownscaleRequired, brokerId)
+		if brokerStatus.GracefulActionState.CruiseControlState.IsRunningState(){
+			err = r.checkCCTaskState(instance, []string{brokerId}, brokerStatus, log)
+			if err != nil {
+				break
 			}
 		}
-
-		if err != nil {
-			switch errors.Cause(err).(type) {
-			case errorfactory.CruiseControlNotReady, errorfactory.ResourceNotReady:
-				return ctrl.Result{
-					RequeueAfter: time.Duration(15) * time.Second,
-				}, nil
-			case errorfactory.CruiseControlTaskRunning:
-				return ctrl.Result{
-					RequeueAfter: time.Duration(20) * time.Second,
-				}, nil
-			case errorfactory.CruiseControlTaskTimeout, errorfactory.CruiseControlTaskFailure:
-				return ctrl.Result{
-					RequeueAfter: time.Duration(20) * time.Second,
-				}, nil
-			default:
-				return requeueWithError(log, err.Error(), err)
-			}
-		}
-
-		// Set volume states
-		for _, volumeState := range brokerStatus.GracefulActionState.VolumeStates {
-			switch volumeState.CruiseControlVolumeState {
-			case v1beta1.GracefulDiskRebalanceRunning:
-				// if succeeded set status to succeeded, if running don't do anything, if failed set status to failed
+		for mountPath, volumeState := range brokerStatus.GracefulActionState.VolumeStates {
+			if volumeState.CruiseControlVolumeState == v1beta1.GracefulDiskRebalanceRunning {
 				err = r.checkVolumeCCTaskState(instance, []string{brokerId}, volumeState, v1beta1.GracefulDiskRebalanceSucceeded, log)
 				if err != nil {
-					switch errors.Cause(err).(type) {
-					case errorfactory.CruiseControlNotReady:
-						return ctrl.Result{
-							RequeueAfter: time.Duration(15) * time.Second,
-						}, nil
-					case errorfactory.CruiseControlTaskRunning:
-						return ctrl.Result{
-							RequeueAfter: time.Duration(20) * time.Second,
-						}, nil
-					case errorfactory.CruiseControlTaskTimeout, errorfactory.CruiseControlTaskFailure:
-						return ctrl.Result{
-							RequeueAfter: time.Duration(20) * time.Second,
-						}, nil
-					default:
-						return requeueWithError(log, err.Error(), err)
-					}
-				}
-
-			case v1beta1.GracefulDiskRebalanceRequired:
-				// create new cc task, set status to running
-				taskId, startTime, err := scale.RebalanceDisks(brokerId, volumeState.MountPath, instance.Namespace, instance.Spec.CruiseControlConfig.CruiseControlEndpoint, instance.Name)
-				if err != nil {
-					switch errors.Cause(err).(type) {
-					case errorfactory.CruiseControlNotReady:
-						return ctrl.Result{
-							RequeueAfter: time.Duration(15) * time.Second,
-						}, nil
-					case errorfactory.CruiseControlTaskRunning:
-						return ctrl.Result{
-							RequeueAfter: time.Duration(20) * time.Second,
-						}, nil
-					case errorfactory.CruiseControlTaskTimeout, errorfactory.CruiseControlTaskFailure:
-						return ctrl.Result{
-							RequeueAfter: time.Duration(20) * time.Second,
-						}, nil
-					default:
-						return requeueWithError(log, err.Error(), err)
-					}
-				}
-				err = k8sutil.UpdateBrokerStatus(r.Client, []string{brokerId}, instance, kafkav1beta1.VolumeState{
-					CruiseControlTaskId: taskId,
-					TaskStarted:         startTime,
-				}, log)
-				if err != nil {
-					return requeueWithError(log, err.Error(), err)
+					break OUTERLOOP
 				}
 			}
 		}
 	}
-
-	err = r.handlePodDeleteCCTask(instance, brokersWithDownscaleRequired, log)
 	if err != nil {
-		return requeueWithError(log, err.Error(), err)
+		switch errors.Cause(err).(type) {
+		case errorfactory.CruiseControlNotReady, errorfactory.ResourceNotReady:
+			return ctrl.Result{
+				RequeueAfter: time.Duration(15) * time.Second,
+			}, nil
+		case errorfactory.CruiseControlTaskRunning:
+			return ctrl.Result{
+				RequeueAfter: time.Duration(20) * time.Second,
+			}, nil
+		case errorfactory.CruiseControlTaskTimeout, errorfactory.CruiseControlTaskFailure:
+			return ctrl.Result{
+				RequeueAfter: time.Duration(20) * time.Second,
+			}, nil
+		default:
+			return requeueWithError(log, err.Error(), err)
+		}
+	}
+
+	var brokersWithDownscaleRequired []string
+	var brokersWithUpscaleRequired []string
+	brokersWithDiskRebalanceRequired :=  make(map[string][]string)
+
+	for brokerId, brokerStatus := range instance.Status.BrokersState {
+
+		if brokerStatus.GracefulActionState.CruiseControlState == v1beta1.GracefulUpscaleRequired {
+			brokersWithUpscaleRequired = append(brokersWithUpscaleRequired, brokerId)
+		} else if brokerStatus.GracefulActionState.CruiseControlState == v1beta1.GracefulDownscaleRequired {
+			brokersWithDownscaleRequired = append(brokersWithDownscaleRequired, brokerId)
+		}
+
+		for mountPath, volumeState := range brokerStatus.GracefulActionState.VolumeStates {
+			if volumeState.CruiseControlVolumeState ==  v1beta1.GracefulDiskRebalanceRequired {
+				brokersWithDiskRebalanceRequired[brokerId] = append(brokersWithDiskRebalanceRequired[brokerId], mountPath)
+			}
+		}
+	}
+
+	if len(brokersWithUpscaleRequired) > 0 {
+		err = r.handlePodAddCCTask(instance, brokersWithUpscaleRequired, log)
+	} else if len(brokersWithDownscaleRequired) > 0 {
+		err = r.handlePodDeleteCCTask(instance, brokersWithDownscaleRequired, log)
+	} else if len(brokersWithDiskRebalanceRequired) > 0 {
+		// create new cc task, set status to running
+		taskId, startTime, err := scale.RebalanceDisks(brokersWithDiskRebalanceRequired, instance.Namespace, instance.Spec.CruiseControlConfig.CruiseControlEndpoint, instance.Name)
+
+		var brokerIds []string
+		brokersVolumeStates := make(map[string]map[string]v1beta1.VolumeState, len(brokersWithDiskRebalanceRequired))
+		for brokerId, mountPaths := range brokersWithDiskRebalanceRequired {
+			brokerIds = append(brokerIds, brokerId)
+			brokerVolumeState := make(map[string]v1beta1.VolumeState, len(mountPaths))
+			for _, mountPath := range mountPaths {
+				brokerVolumeState[mountPath] = kafkav1beta1.VolumeState{
+					CruiseControlTaskId: taskId,
+					TaskStarted:         startTime,
+					CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRunning,
+				}
+			}
+
+		}
+		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, instance, brokersVolumeStates, log)
+		if err != nil {
+			return requeueWithError(log, err.Error(), err)
+		}
+	}
+
+	if err != nil {
+		switch errors.Cause(err).(type) {
+		case errorfactory.CruiseControlNotReady:
+			return ctrl.Result{
+				RequeueAfter: time.Duration(15) * time.Second,
+			}, nil
+		case errorfactory.CruiseControlTaskRunning:
+			return ctrl.Result{
+				RequeueAfter: time.Duration(20) * time.Second,
+			}, nil
+		case errorfactory.CruiseControlTaskTimeout, errorfactory.CruiseControlTaskFailure:
+			return ctrl.Result{
+				RequeueAfter: time.Duration(20) * time.Second,
+			}, nil
+		default:
+			return requeueWithError(log, err.Error(), err)
+		}
 	}
 
 	return reconciled()
 }
-func (r *CruiseControlReconciler) handlePodAddCCTask(kafkaCluster *v1beta1.KafkaCluster, brokerId string, brokerState kafkav1beta1.BrokerState, log logr.Logger) error {
-	podList := &corev1.PodList{}
-
-	matchingLabels := client.MatchingLabels(
-		util.MergeLabels(
-			kafka.LabelsForKafka(kafkaCluster.Name),
-			map[string]string{"brokerId": brokerId},
-		),
-	)
-	err := r.Client.List(context.TODO(), podList, client.InNamespace(kafkaCluster.Namespace), matchingLabels)
-	if err != nil && len(podList.Items) == 0 {
-		return errorfactory.New(errorfactory.APIFailure{}, err, "getting resource failed")
+func (r *CruiseControlReconciler) handlePodAddCCTask(kafkaCluster *v1beta1.KafkaCluster, brokerIds []string, log logr.Logger) error {
+	uTaskId, taskStartTime, scaleErr := scale.UpScaleCluster(brokerIds, kafkaCluster.Namespace, kafkaCluster.Spec.CruiseControlConfig.CruiseControlEndpoint, kafkaCluster.Name)
+	if scaleErr != nil {
+		log.Info("cruise control communication error during upscaling broker(s)", "brokerId(s)", brokerIds)
+		return errorfactory.New(errorfactory.CruiseControlNotReady{}, scaleErr, fmt.Sprintf("broker id(s): %s", brokerIds))
 	}
-	if len(podList.Items) == 1 {
-
-		podStatus := podList.Items[0].DeepCopy().Status.Phase
-		if podStatus == corev1.PodPending {
-			return errorfactory.New(errorfactory.ResourceNotReady{}, errors.New("broker pod is in pending state"), fmt.Sprintf("broker id: %s", brokerId))
-		}
-		if podStatus == corev1.PodRunning &&
-			brokerState.GracefulActionState.CruiseControlState == v1beta1.GracefulUpscaleRequired {
-			//trigger add broker in CC
-			uTaskId, taskStartTime, scaleErr := scale.UpScaleCluster(brokerId, kafkaCluster.Namespace, kafkaCluster.Spec.CruiseControlConfig.CruiseControlEndpoint, kafkaCluster.Name)
-			if scaleErr != nil {
-				log.Info("cruise control communication error during upscaling broker", "brokerId", brokerId)
-				return errorfactory.New(errorfactory.CruiseControlNotReady{}, scaleErr, fmt.Sprintf("broker id: %s", brokerId))
-			}
-			statusErr := k8sutil.UpdateBrokerStatus(r.Client, []string{brokerId}, kafkaCluster,
-				v1beta1.GracefulActionState{CruiseControlTaskId: uTaskId, CruiseControlState: v1beta1.GracefulUpscaleRunning,
-					TaskStarted: taskStartTime}, log)
-			if statusErr != nil {
-				return errors.WrapIfWithDetails(err, "could not update status for broker", "id", brokerId)
-			}
-		}
-		if brokerState.GracefulActionState.CruiseControlState == v1beta1.GracefulUpscaleRunning {
-			err = r.checkCCTaskState(kafkaCluster, []string{brokerId}, brokerState, v1beta1.GracefulUpscaleSucceeded, log)
-			if err != nil {
-				return err
-			}
-		}
-
+	statusErr := k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster,
+		v1beta1.GracefulActionState{CruiseControlTaskId: uTaskId, CruiseControlState: v1beta1.GracefulUpscaleRunning,
+			TaskStarted: taskStartTime}, log)
+	if statusErr != nil {
+		return errors.WrapIfWithDetails(statusErr, "could not update status for broker", "id(s)", brokerIds)
 	}
-
 	return nil
 }
 func (r *CruiseControlReconciler) handlePodDeleteCCTask(kafkaCluster *v1beta1.KafkaCluster, brokerIds []string, log logr.Logger) error {
@@ -237,7 +208,7 @@ func (r *CruiseControlReconciler) handlePodDeleteCCTask(kafkaCluster *v1beta1.Ka
 	return nil
 }
 
-func (r *CruiseControlReconciler) checkCCTaskState(kafkaCluster *v1beta1.KafkaCluster, brokerIds []string, brokerState v1beta1.BrokerState, cruiseControlState v1beta1.CruiseControlState, log logr.Logger) error {
+func (r *CruiseControlReconciler) checkCCTaskState(kafkaCluster *v1beta1.KafkaCluster, brokerIds []string, brokerState v1beta1.BrokerState, log logr.Logger) error {
 
 	// check cc task status
 	status, err := scale.GetCCTaskState(brokerState.GracefulActionState.CruiseControlTaskId,
