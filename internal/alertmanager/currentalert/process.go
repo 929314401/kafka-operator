@@ -95,6 +95,10 @@ func (e *examiner) examineAlert(rollingUpgradeAlertCount int) (bool, error) {
 		return false, err
 	}
 
+	if cr == nil {
+		return false, errors.New("kafkaCR is nil")
+	}
+
 	if err := k8sutil.UpdateCrWithRollingUpgrade(rollingUpgradeAlertCount, cr, e.Client); err != nil {
 		return false, err
 	}
