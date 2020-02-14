@@ -317,7 +317,7 @@ func upScale(log logr.Logger, labels model.LabelSet, annotations model.LabelSet,
 				Image: string(annotations["image"]),
 				StorageConfigs: []v1beta1.StorageConfig{
 					{
-						MountPath: string(annotations["mountPathPrefix"]),
+						MountPath: string(annotations["mountPath"]),
 						PvcSpec: &corev1.PersistentVolumeClaimSpec{
 							AccessModes: []corev1.PersistentVolumeAccessMode{
 								corev1.ReadWriteOnce,
