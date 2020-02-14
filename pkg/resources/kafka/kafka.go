@@ -739,14 +739,26 @@ func (r *Reconciler) reconcileKafkaPvc(log logr.Logger, desiredPvc *corev1.Persi
 		if err := r.Client.Create(context.TODO(), desiredPvc); err != nil {
 			return errorfactory.New(errorfactory.APIFailure{}, err, "creating resource failed", "kind", desiredType)
 		}
-		err = k8sutil.UpdateBrokerStatus(r.Client, []string{desiredPvc.Labels["brokerId"]},
-			// get pods with brokerid, then run this line below
-			r.KafkaCluster, v1beta1.VolumeState{
-				MountPath:                desiredPvc.Annotations["mountPath"],
-				CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRequired,
-			}, log)
-		if err != nil {
-			return err
+
+		podList := &corev1.PodList{}
+		matchingLabels := client.MatchingLabels(
+			util.MergeLabels(
+				LabelsForKafka(r.KafkaCluster.Name),
+				map[string]string{"brokerId": desiredPvc.Labels["brokerId"]},
+			),
+		)
+		err := r.Client.List(context.TODO(), podList, client.InNamespace(r.KafkaCluster.Namespace), matchingLabels)
+		if err != nil && len(podList.Items) == 0 {
+			return errorfactory.New(errorfactory.APIFailure{}, err, "getting resource failed")
+		} else if len(podList.Items) == 1 {
+			err = k8sutil.UpdateBrokerStatus(r.Client, []string{desiredPvc.Labels["brokerId"]},
+				r.KafkaCluster, v1beta1.VolumeState{
+					MountPath:                desiredPvc.Annotations["mountPath"],
+					CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRequired,
+				}, log)
+			if err != nil {
+				return err
+			}
 		}
 
 		return nil
