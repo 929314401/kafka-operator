@@ -179,7 +179,7 @@ func ParsePropertiesFormat(properties string) map[string]string {
 func AreStringSlicesIdentical(a, b []string) bool {
 	sort.Strings(a)
 	sort.Strings(b)
-	return reflect.DeepEqual(a,b)
+	return reflect.DeepEqual(a, b)
 }
 
 // GetBrokerConfig compose the brokerConfig for a given broker

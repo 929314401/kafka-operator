@@ -478,12 +478,3 @@ func GetCCTaskState(uTaskId, namespace, ccEndpoint, clusterName string) (banzaic
 	log.Info("Cruise control task not found", "taskID", uTaskId)
 	return banzaicloudv1beta1.CruiseControlTaskNotFound, nil
 }
-
-func contains(slice []string, value string) bool {
-	for _, item := range slice {
-		if item == value {
-			return true
-		}
-	}
-	return false
-}

@@ -39,11 +39,11 @@ type PKIBackend string
 type CruiseControlVolumeState string
 
 func (r CruiseControlState) IsUpscale() bool {
-	return r == GracefulUpscaleRequired || r == GracefulUpscaleSucceeded
+	return r == GracefulUpscaleRequired || r == GracefulUpscaleSucceeded || r == GracefulUpscaleRunning
 }
 
 func (r CruiseControlState) IsDownscale() bool {
-	return r == GracefulDownscaleRequired || r == GracefulDownscaleSucceeded
+	return r == GracefulDownscaleRequired || r == GracefulDownscaleSucceeded || r == GracefulDownscaleRunning
 }
 
 func (r CruiseControlState) IsRunningState() bool {
@@ -52,6 +52,17 @@ func (r CruiseControlState) IsRunningState() bool {
 
 func (r CruiseControlState) IsRequiredState() bool {
 	return r == GracefulDownscaleRequired || r == GracefulUpscaleRequired
+}
+
+func (r CruiseControlState) Complete() CruiseControlState {
+	switch r {
+	case GracefulUpscaleRequired, GracefulUpscaleRunning:
+		return GracefulUpscaleSucceeded
+	case GracefulDownscaleRequired, GracefulDownscaleRunning:
+		return GracefulDownscaleSucceeded
+	default:
+		return r
+	}
 }
 
 const (

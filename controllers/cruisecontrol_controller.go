@@ -71,25 +71,31 @@ func (r *CruiseControlReconciler) Reconcile(request ctrl.Request) (ctrl.Result, 
 
 	log.V(1).Info("Reconciling")
 
-	// TODO beatify this (baluchicken)
-	// Check if CC has a running task it is based on CR status
-	OUTERLOOP:
+	brokersStatus := make(map[string]v1beta1.BrokerState)
+	brokersVolumesState := make(map[string]map[string]v1beta1.VolumeState)
 	for brokerId, brokerStatus := range instance.Status.BrokersState {
-		if brokerStatus.GracefulActionState.CruiseControlState.IsRunningState(){
-			err = r.checkCCTaskState(instance, []string{brokerId}, brokerStatus, log)
-			if err != nil {
-				break
-			}
+		if brokerStatus.GracefulActionState.CruiseControlState.IsRunningState() {
+			brokersStatus[brokerId] = brokerStatus
 		}
+
+		volumesState := make(map[string]v1beta1.VolumeState)
 		for mountPath, volumeState := range brokerStatus.GracefulActionState.VolumeStates {
 			if volumeState.CruiseControlVolumeState == v1beta1.GracefulDiskRebalanceRunning {
-				err = r.checkVolumeCCTaskState(instance, []string{brokerId}, volumeState, v1beta1.GracefulDiskRebalanceSucceeded, log)
-				if err != nil {
-					break OUTERLOOP
-				}
+				volumesState[mountPath] = volumeState
 			}
 		}
+		if len(volumesState) > 0 {
+			brokersVolumesState[brokerId] = volumesState
+		}
 	}
+	if len(brokersStatus) > 0 {
+		err = r.checkCCTaskState(instance, brokersStatus, log)
+	}
+
+	if err == nil && len(brokersVolumesState) > 0 {
+		err = r.checkVolumeCCTaskState(instance, brokersVolumesState, log)
+	}
+
 	if err != nil {
 		switch errors.Cause(err).(type) {
 		case errorfactory.CruiseControlNotReady, errorfactory.ResourceNotReady:
@@ -111,7 +117,7 @@ func (r *CruiseControlReconciler) Reconcile(request ctrl.Request) (ctrl.Result, 
 
 	var brokersWithDownscaleRequired []string
 	var brokersWithUpscaleRequired []string
-	brokersWithDiskRebalanceRequired :=  make(map[string][]string)
+	brokersWithDiskRebalanceRequired := make(map[string][]string)
 
 	for brokerId, brokerStatus := range instance.Status.BrokersState {
 
@@ -122,7 +128,7 @@ func (r *CruiseControlReconciler) Reconcile(request ctrl.Request) (ctrl.Result, 
 		}
 
 		for mountPath, volumeState := range brokerStatus.GracefulActionState.VolumeStates {
-			if volumeState.CruiseControlVolumeState ==  v1beta1.GracefulDiskRebalanceRequired {
+			if volumeState.CruiseControlVolumeState == v1beta1.GracefulDiskRebalanceRequired {
 				brokersWithDiskRebalanceRequired[brokerId] = append(brokersWithDiskRebalanceRequired[brokerId], mountPath)
 			}
 		}
@@ -143,8 +149,8 @@ func (r *CruiseControlReconciler) Reconcile(request ctrl.Request) (ctrl.Result, 
 			brokerVolumeState := make(map[string]v1beta1.VolumeState, len(mountPaths))
 			for _, mountPath := range mountPaths {
 				brokerVolumeState[mountPath] = kafkav1beta1.VolumeState{
-					CruiseControlTaskId: taskId,
-					TaskStarted:         startTime,
+					CruiseControlTaskId:      taskId,
+					TaskStarted:              startTime,
 					CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRunning,
 				}
 			}
@@ -208,80 +214,139 @@ func (r *CruiseControlReconciler) handlePodDeleteCCTask(kafkaCluster *v1beta1.Ka
 	return nil
 }
 
-func (r *CruiseControlReconciler) checkCCTaskState(kafkaCluster *v1beta1.KafkaCluster, brokerIds []string, brokerState v1beta1.BrokerState, log logr.Logger) error {
+func (r *CruiseControlReconciler) checkCCTaskState(kafkaCluster *v1beta1.KafkaCluster, brokersState map[string]v1beta1.BrokerState, log logr.Logger) error {
+	if len(brokersState) == 0 {
+		return nil
+	}
+
+	// a CC task may run for one or multiple brokers (e.g add_broker for multiple brokers)
+	// check that all brokers that we check the CC task status for have the same task id
+	var ccTaskId string
+	for _, brokerState := range brokersState {
+		if ccTaskId == "" {
+			ccTaskId = brokerState.GracefulActionState.CruiseControlTaskId
+		} else if ccTaskId != brokerState.GracefulActionState.CruiseControlTaskId {
+			return errors.New("multiple CC task ids found")
+		}
+	}
+
+	if ccTaskId == "" {
+		return errors.New("no CC task id provided to be checked")
+	}
 
 	// check cc task status
-	status, err := scale.GetCCTaskState(brokerState.GracefulActionState.CruiseControlTaskId,
-		kafkaCluster.Namespace, kafkaCluster.Spec.CruiseControlConfig.CruiseControlEndpoint, kafkaCluster.Name)
+	status, err := scale.GetCCTaskState(ccTaskId, kafkaCluster.Namespace, kafkaCluster.Spec.CruiseControlConfig.CruiseControlEndpoint, kafkaCluster.Name)
 	if err != nil {
-		log.Info("Cruise control communication error checking running task", "taskId", brokerState.GracefulActionState.CruiseControlTaskId)
+		log.Info("Cruise control communication error checking running task", "taskId", ccTaskId)
 		return errorfactory.New(errorfactory.CruiseControlNotReady{}, err, "cc communication error")
 	}
 
 	if status == v1beta1.CruiseControlTaskNotFound || status == v1beta1.CruiseControlTaskCompletedWithError {
 		// CC task failed or not found in CC,
 		// reschedule it by marking broker CruiseControlState= GracefulUpscaleRequired or GracefulDownscaleRequired
-		requiredCCState, err := r.getCorrectRequiredCCState(brokerState.GracefulActionState.CruiseControlState)
-		if err != nil {
-			return err
+		var brokerIds []string
+		requiredBrokerCCState := make(map[string]v1beta1.GracefulActionState, len(brokersState))
+		for brokerId, brokerState := range brokersState {
+			requiredCCState, err := r.getCorrectRequiredCCState(brokerState.GracefulActionState.CruiseControlState)
+			if err != nil {
+				return err
+			}
+
+			brokerIds = append(brokerIds, brokerId)
+			requiredBrokerCCState[brokerId] = v1beta1.GracefulActionState{
+				CruiseControlState: requiredCCState,
+				ErrorMessage:       "Previous cc task status invalid",
+			}
 		}
 
-		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster,
-			v1beta1.GracefulActionState{CruiseControlState: requiredCCState,
-				ErrorMessage: "Previous cc task status invalid",
-			}, log)
+		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster, requiredBrokerCCState, log)
 
 		if err != nil {
 			return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokerIds, ","))
 		}
-		return errorfactory.New(errorfactory.CruiseControlTaskFailure{}, err, "CC task failed", fmt.Sprintf("cc task id: %s", brokerState.GracefulActionState.CruiseControlTaskId))
+		return errorfactory.New(errorfactory.CruiseControlTaskFailure{}, err, "CC task failed", fmt.Sprintf("cc task id: %s", ccTaskId))
 	}
 
 	if status == v1beta1.CruiseControlTaskCompleted {
 		// cc task completed successfully
-		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster,
-			v1beta1.GracefulActionState{CruiseControlState: cruiseControlState,
+		var brokerIds []string
+		completedBrokerCCState := make(map[string]v1beta1.GracefulActionState, len(brokersState))
+		for brokerId, brokerState := range brokersState {
+			brokerIds = append(brokerIds, brokerId)
+
+			completedBrokerCCState[brokerId] = v1beta1.GracefulActionState{
+				CruiseControlState:  brokerState.GracefulActionState.CruiseControlState.Complete(),
 				TaskStarted:         brokerState.GracefulActionState.TaskStarted,
 				CruiseControlTaskId: brokerState.GracefulActionState.CruiseControlTaskId,
-			}, log)
+			}
+		}
+
+		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster, completedBrokerCCState, log)
 		if err != nil {
 			return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokerIds, ","))
 		}
 		return nil
 	}
-	// cc task still in progress
-	parsedTime, err := ccutils.ParseTimeStampToUnixTime(brokerState.GracefulActionState.TaskStarted)
-	if err != nil {
-		return errors.WrapIf(err, "could not parse timestamp")
-	}
-	if time.Now().Sub(parsedTime).Minutes() < kafkaCluster.Spec.CruiseControlConfig.CruiseControlTaskSpec.GetDurationMinutes() {
-		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster,
-			v1beta1.GracefulActionState{TaskStarted: brokerState.GracefulActionState.TaskStarted,
-				CruiseControlTaskId: brokerState.GracefulActionState.CruiseControlTaskId,
-				CruiseControlState:  brokerState.GracefulActionState.CruiseControlState,
-			}, log)
-		if err != nil {
-			return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokerIds, ","))
+	var brokersWithRunningCCTask, brokersWithTimedOutCCTask []string
+	runningBrokerCCState := make(map[string]v1beta1.GracefulActionState)
+	timedOutBrokerCCState := make(map[string]v1beta1.GracefulActionState)
+	for brokerId, brokerState := range brokersState {
+		if brokerState.GracefulActionState.CruiseControlState.IsRunningState() {
+			parsedTime, err := ccutils.ParseTimeStampToUnixTime(brokerState.GracefulActionState.TaskStarted)
+			if err != nil {
+				return errors.WrapIf(err, "could not parse timestamp")
+			}
+			if time.Now().Sub(parsedTime).Minutes() < kafkaCluster.Spec.CruiseControlConfig.CruiseControlTaskSpec.GetDurationMinutes() {
+				brokersWithRunningCCTask = append(brokersWithRunningCCTask, brokerId)
+				runningBrokerCCState[brokerId] = v1beta1.GracefulActionState{
+					TaskStarted:         brokerState.GracefulActionState.TaskStarted,
+					CruiseControlTaskId: brokerState.GracefulActionState.CruiseControlTaskId,
+					CruiseControlState:  brokerState.GracefulActionState.CruiseControlState,
+				}
+
+			} else {
+				brokersWithTimedOutCCTask = append(brokersWithTimedOutCCTask, brokerId)
+				requiredCCState, err := r.getCorrectRequiredCCState(brokerState.GracefulActionState.CruiseControlState)
+				if err != nil {
+					return err
+				}
+
+				timedOutBrokerCCState[brokerId] = v1beta1.GracefulActionState{
+					CruiseControlState:  requiredCCState,
+					CruiseControlTaskId: brokerState.GracefulActionState.CruiseControlTaskId,
+					ErrorMessage:        "Timed out waiting for the task to complete",
+					TaskStarted:         brokerState.GracefulActionState.TaskStarted,
+				}
+			}
 		}
-		log.Info("Cruise control task is still running", "taskId", brokerState.GracefulActionState.CruiseControlTaskId)
-		return errorfactory.New(errorfactory.CruiseControlTaskRunning{}, errors.New("cc task is still running"), fmt.Sprintf("cc task id: %s", brokerState.GracefulActionState.CruiseControlTaskId))
 	}
+
+	// cc task still in progress
+	if len(brokersWithRunningCCTask) > 0 {
+		err = k8sutil.UpdateBrokerStatus(r.Client, brokersWithRunningCCTask, kafkaCluster, runningBrokerCCState, log)
+		if err != nil {
+			return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokersWithRunningCCTask, ","))
+		}
+		log.Info("Cruise control task is still running", "taskId", ccTaskId)
+		return errorfactory.New(errorfactory.CruiseControlTaskRunning{}, errors.New("cc task is still running"), fmt.Sprintf("cc task id: %s", ccTaskId))
+	}
+
 	// task timed out
-	log.Info("Killing Cruise control task", "taskId", brokerState.GracefulActionState.CruiseControlTaskId)
-	err = scale.KillCCTask(kafkaCluster.Namespace, kafkaCluster.Spec.CruiseControlConfig.CruiseControlEndpoint, kafkaCluster.Name)
-	if err != nil {
-		return errorfactory.New(errorfactory.CruiseControlNotReady{}, err, "cc communication error")
+	if len(brokersWithTimedOutCCTask) > 0 {
+		log.Info("Killing Cruise control task", "taskId", ccTaskId)
+		err = scale.KillCCTask(kafkaCluster.Namespace, kafkaCluster.Spec.CruiseControlConfig.CruiseControlEndpoint, kafkaCluster.Name)
+		if err != nil {
+			return errorfactory.New(errorfactory.CruiseControlNotReady{}, err, "cc communication error")
+		}
+
+		err = k8sutil.UpdateBrokerStatus(r.Client, brokersWithRunningCCTask, kafkaCluster, timedOutBrokerCCState, log)
+		if err != nil {
+			return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokersWithRunningCCTask, ","))
+		}
+		return errorfactory.New(errorfactory.CruiseControlTaskTimeout{}, errors.New("cc task timed out"), fmt.Sprintf("cc task id: %s", ccTaskId))
 	}
-	err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster,
-		v1beta1.GracefulActionState{CruiseControlState: v1beta1.GracefulUpscaleRequired,
-			CruiseControlTaskId: brokerState.GracefulActionState.CruiseControlTaskId,
-			ErrorMessage:        "Timed out waiting for the task to complete",
-			TaskStarted:         brokerState.GracefulActionState.TaskStarted,
-		}, log)
-	if err != nil {
-		return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokerIds, ","))
-	}
-	return errorfactory.New(errorfactory.CruiseControlTaskTimeout{}, errors.New("cc task timed out"), fmt.Sprintf("cc task id: %s", brokerState.GracefulActionState.CruiseControlTaskId))
+
+	return nil
 }
 
 // getCorrectRequiredCCState returns the correct Required CC state based on that we upscale or downscale
@@ -296,75 +361,151 @@ func (r *CruiseControlReconciler) getCorrectRequiredCCState(ccState kafkav1beta1
 }
 
 //TODO merge with checkCCTaskState into one func (hi-im-aren)
-func (r *CruiseControlReconciler) checkVolumeCCTaskState(kafkaCluster *v1beta1.KafkaCluster, brokerIds []string, volumeState v1beta1.VolumeState, cruiseControlVolumeState v1beta1.CruiseControlVolumeState, log logr.Logger) error {
+func (r *CruiseControlReconciler) checkVolumeCCTaskState(kafkaCluster *v1beta1.KafkaCluster, brokersVolumesState map[string]map[string]v1beta1.VolumeState, log logr.Logger) error {
+	if len(brokersVolumesState) == 0 {
+		return nil
+	}
+
+	var ccTaskId string
+	for _, brokerVolumesState := range brokersVolumesState {
+		for _, volumeState := range brokerVolumesState {
+			if ccTaskId == "" {
+				ccTaskId = volumeState.CruiseControlTaskId
+			} else if ccTaskId != volumeState.CruiseControlTaskId {
+				return errors.New("multiple rebalance disk CC task ids found")
+			}
+		}
+	}
+
+	if ccTaskId == "" {
+		return errors.New("no CC task id provided to be checked")
+	}
 
 	// check cc task status
-	status, err := scale.GetCCTaskState(volumeState.CruiseControlTaskId,
-		kafkaCluster.Namespace, kafkaCluster.Spec.CruiseControlConfig.CruiseControlEndpoint, kafkaCluster.Name)
+	status, err := scale.GetCCTaskState(ccTaskId, kafkaCluster.Namespace, kafkaCluster.Spec.CruiseControlConfig.CruiseControlEndpoint, kafkaCluster.Name)
 	if err != nil {
-		log.Info("Cruise control communication error checking running task", "taskId", volumeState.CruiseControlTaskId)
+		log.Info("Cruise control communication error checking running task", "taskId", ccTaskId)
 		return errorfactory.New(errorfactory.CruiseControlNotReady{}, err, "cc communication error")
 	}
 
 	if status == v1beta1.CruiseControlTaskNotFound || status == v1beta1.CruiseControlTaskCompletedWithError {
 		// CC task failed or not found in CC,
 		// reschedule it by marking volume CruiseControlVolumeState=GracefulDiskRebalanceRequired
-		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster,
-			kafkav1beta1.VolumeState{
-				CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRequired,
-				ErrorMessage:             "Previous cc task status invalid",
-			}, log)
-		if err != nil {
-			return errors.WrapIfWithDetails(err, "could not update status for broker volume(s)", "id(s)", strings.Join(brokerIds, ","), "mountPath:", volumeState.MountPath)
+		var brokerIds []string
+		requiredBrokerVolumesCCState := make(map[string]map[string]v1beta1.VolumeState, len(brokersVolumesState))
+		for brokerId, volumesState := range brokersVolumesState {
+			brokerIds = append(brokerIds, brokerId)
+
+			volumesState := make(map[string]v1beta1.VolumeState, len(volumesState))
+			for mountPath := range volumesState {
+				volumesState[mountPath] = kafkav1beta1.VolumeState{
+					CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRequired,
+					ErrorMessage:             "Previous disk rebalance cc task status invalid",
+				}
+			}
+
+			requiredBrokerVolumesCCState[brokerId] = volumesState
 		}
-		return errorfactory.New(errorfactory.CruiseControlTaskFailure{}, err, "CC task failed", fmt.Sprintf("cc task id: %s", volumeState.CruiseControlTaskId))
+		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster, requiredBrokerVolumesCCState, log)
+		if err != nil {
+			return errors.WrapIfWithDetails(err, "could not update status for broker volume(s)", "id(s)", strings.Join(brokerIds, ","))
+		}
+		return errorfactory.New(errorfactory.CruiseControlTaskFailure{}, err, "CC task failed", fmt.Sprintf("cc task id: %s", ccTaskId))
 	}
 
 	if status == v1beta1.CruiseControlTaskCompleted {
 		// cc task completed successfully
-		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster,
-			kafkav1beta1.VolumeState{CruiseControlVolumeState: cruiseControlVolumeState,
-				TaskStarted:         volumeState.TaskStarted,
-				CruiseControlTaskId: volumeState.CruiseControlTaskId,
-			}, log)
+		var brokerIds []string
+		rebalanceCompletedVolumesState := make(map[string]map[string]v1beta1.VolumeState, len(brokersVolumesState))
+		for brokerId, volumesState := range brokersVolumesState {
+			brokerIds = append(brokerIds, brokerId)
+
+			volumesState := make(map[string]v1beta1.VolumeState, len(volumesState))
+			for mountPath, volumeState := range volumesState {
+				volumesState[mountPath] = kafkav1beta1.VolumeState{
+					CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceSucceeded,
+					TaskStarted:              volumeState.TaskStarted,
+					CruiseControlTaskId:      volumeState.CruiseControlTaskId,
+				}
+			}
+
+			rebalanceCompletedVolumesState[brokerId] = volumesState
+		}
+
+		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster, rebalanceCompletedVolumesState, log)
 		if err != nil {
 			return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokerIds, ","))
 		}
 		return nil
 	}
-	// cc task still in progress
-	parsedTime, err := ccutils.ParseTimeStampToUnixTime(volumeState.TaskStarted)
-	if err != nil {
-		return errors.WrapIf(err, "could not parse timestamp")
-	}
-	if time.Now().Sub(parsedTime).Minutes() < kafkaCluster.Spec.CruiseControlConfig.CruiseControlTaskSpec.GetDurationMinutes() {
-		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster,
-			kafkav1beta1.VolumeState{TaskStarted: volumeState.TaskStarted,
-				CruiseControlTaskId:      volumeState.CruiseControlTaskId,
-				CruiseControlVolumeState: volumeState.CruiseControlVolumeState,
-			}, log)
-		if err != nil {
-			return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokerIds, ","))
+
+	var brokersWithRunningCCTask, brokersWithTimedOutCCTask []string
+	brokersVolumesStateWithRunningDiskCCTask := make(map[string]map[string]v1beta1.VolumeState)
+	brokersVolumesStateWithTimedOutDiskCCTask := make(map[string]map[string]v1beta1.VolumeState)
+
+	for brokerId, volumesState := range brokersVolumesState {
+		volumesStateWithRunningDiskCCTask := make(map[string]v1beta1.VolumeState)
+		volumesStateWithTimedOutDiskCCTask := make(map[string]v1beta1.VolumeState)
+
+		for mountPath, volumeState := range volumesState {
+			if volumeState.CruiseControlVolumeState == v1beta1.GracefulDiskRebalanceRunning {
+				parsedTime, err := ccutils.ParseTimeStampToUnixTime(volumeState.TaskStarted)
+				if err != nil {
+					return errors.WrapIf(err, "could not parse timestamp")
+				}
+
+				if time.Now().Sub(parsedTime).Minutes() < kafkaCluster.Spec.CruiseControlConfig.CruiseControlTaskSpec.GetDurationMinutes() {
+					volumesStateWithRunningDiskCCTask[mountPath] = kafkav1beta1.VolumeState{
+						TaskStarted:              volumeState.TaskStarted,
+						CruiseControlTaskId:      volumeState.CruiseControlTaskId,
+						CruiseControlVolumeState: volumeState.CruiseControlVolumeState,
+					}
+				} else {
+					brokersWithTimedOutCCTask = append(brokersWithTimedOutCCTask, brokerId)
+
+					volumesStateWithTimedOutDiskCCTask[mountPath] = kafkav1beta1.VolumeState{
+						CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRequired,
+						CruiseControlTaskId:      volumeState.CruiseControlTaskId,
+						ErrorMessage:             "Timed out waiting for the disk rebalance cc task to complete",
+						TaskStarted:              volumeState.TaskStarted,
+					}
+				}
+			}
 		}
-		log.Info("Cruise control task is still running", "taskId", volumeState.CruiseControlTaskId)
-		return errorfactory.New(errorfactory.CruiseControlTaskRunning{}, errors.New("cc task is still running"), fmt.Sprintf("cc task id: %s", volumeState.CruiseControlTaskId))
+
+		if len(volumesStateWithRunningDiskCCTask) > 0 {
+			brokersWithRunningCCTask = append(brokersWithRunningCCTask, brokerId)
+			brokersVolumesStateWithRunningDiskCCTask[brokerId] = volumesStateWithRunningDiskCCTask
+		}
+
+		brokersVolumesStateWithTimedOutDiskCCTask[brokerId] = volumesStateWithTimedOutDiskCCTask
 	}
+
+	// cc task still in progress
+	if len(brokersWithRunningCCTask) > 0 {
+		err = k8sutil.UpdateBrokerStatus(r.Client, brokersWithRunningCCTask, kafkaCluster, brokersVolumesStateWithRunningDiskCCTask, log)
+		if err != nil {
+			return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokersWithRunningCCTask, ","))
+		}
+		log.Info("Cruise control task is still running", "taskId", ccTaskId)
+		return errorfactory.New(errorfactory.CruiseControlTaskRunning{}, errors.New("cc task is still running"), fmt.Sprintf("cc task id: %s", ccTaskId))
+	}
+
 	// task timed out
-	log.Info("Killing Cruise control task", "taskId", volumeState.CruiseControlTaskId)
-	err = scale.KillCCTask(kafkaCluster.Namespace, kafkaCluster.Spec.CruiseControlConfig.CruiseControlEndpoint, kafkaCluster.Name)
-	if err != nil {
-		return errorfactory.New(errorfactory.CruiseControlNotReady{}, err, "cc communication error")
+	if len(brokersWithTimedOutCCTask) > 0 {
+		log.Info("Killing Cruise control task", "taskId", ccTaskId)
+		err = scale.KillCCTask(kafkaCluster.Namespace, kafkaCluster.Spec.CruiseControlConfig.CruiseControlEndpoint, kafkaCluster.Name)
+		if err != nil {
+			return errorfactory.New(errorfactory.CruiseControlNotReady{}, err, "cc communication error")
+		}
+		err = k8sutil.UpdateBrokerStatus(r.Client, brokersWithTimedOutCCTask, kafkaCluster, brokersVolumesStateWithTimedOutDiskCCTask, log)
+		if err != nil {
+			return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokersWithTimedOutCCTask, ","))
+		}
+		return errorfactory.New(errorfactory.CruiseControlTaskTimeout{}, errors.New("cc task timed out"), fmt.Sprintf("cc task id: %s", ccTaskId))
 	}
-	err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, kafkaCluster,
-		kafkav1beta1.VolumeState{CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRequired,
-			CruiseControlTaskId: volumeState.CruiseControlTaskId,
-			ErrorMessage:        "Timed out waiting for the task to complete",
-			TaskStarted:         volumeState.TaskStarted,
-		}, log)
-	if err != nil {
-		return errors.WrapIfWithDetails(err, "could not update status for broker(s)", "id(s)", strings.Join(brokerIds, ","))
-	}
-	return errorfactory.New(errorfactory.CruiseControlTaskTimeout{}, errors.New("cc task timed out"), fmt.Sprintf("cc task id: %s", volumeState.CruiseControlTaskId))
+
+	return nil
 }
 
 // SetupCruiseControlWithManager registers cruise control controller to the manager
