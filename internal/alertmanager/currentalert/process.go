@@ -74,10 +74,13 @@ func (e *examiner) getKafkaCr() (*v1beta1.KafkaCluster, error) {
 			if err != nil {
 				return nil, err
 			}
-			kafkaCr = model.LabelValue(pvc.Labels["kafka_cr"])
-			cr, err = k8sutil.GetCr(string(kafkaCr), string(e.Alert.Labels["namespace"]), e.Client)
-			if err != nil {
-				return nil, err
+			if kafkaCr, ok := pvc.GetLabels()["kafka_cr"]; ok {
+				cr, err = k8sutil.GetCr(kafkaCr, string(e.Alert.Labels["namespace"]), e.Client)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				return nil, errors.New("persistentvolumeclaim doesn't contain kafka_cr label")
 			}
 		}
 	}
@@ -90,6 +93,10 @@ func (e *examiner) examineAlert(rollingUpgradeAlertCount int) (bool, error) {
 	cr, err := e.getKafkaCr()
 	if err != nil {
 		return false, err
+	}
+
+	if cr == nil {
+		return false, errors.New("kafkaCR is nil")
 	}
 
 	if err := k8sutil.UpdateCrWithRollingUpgrade(rollingUpgradeAlertCount, cr, e.Client); err != nil {
@@ -314,7 +321,7 @@ func upScale(log logr.Logger, labels model.LabelSet, annotations model.LabelSet,
 				Image: string(annotations["image"]),
 				StorageConfigs: []v1beta1.StorageConfig{
 					{
-						MountPath: string(annotations["mountPathPrefix"]),
+						MountPath: string(annotations["mountPath"]),
 						PvcSpec: &corev1.PersistentVolumeClaimSpec{
 							AccessModes: []corev1.PersistentVolumeAccessMode{
 								corev1.ReadWriteOnce,
@@ -341,13 +348,14 @@ func upScale(log logr.Logger, labels model.LabelSet, annotations model.LabelSet,
 
 // getPvc returns the given PVC object
 func getPvc(name, namespace string, client client.Client) (*corev1.PersistentVolumeClaim, error) {
-	cr := &corev1.PersistentVolumeClaim{}
+	pvc := &corev1.PersistentVolumeClaim{}
 
-	err := client.Get(context.TODO(), types.NamespacedName{Name: name, Namespace: namespace}, cr)
+	err := client.Get(context.TODO(), types.NamespacedName{Name: name, Namespace: namespace}, pvc)
+
 	if err != nil {
 		return nil, errors.WrapIfWithDetails(err, "could not get PVC from k8s", "PVCName", name, "namespace", namespace)
 	}
-	return cr, nil
+	return pvc, nil
 }
 
 func pendingOrRunningCCTaskExists(pvcLabels map[string]string, client client.Client, log logr.Logger) (bool, error) {
