@@ -146,10 +146,19 @@ func isKafkaBrokerDiskReady(brokerIdsWithMountPath map[string][]string, namespac
 	}
 
 	for brokerId, volumeMounts := range brokerIdsWithMountPath {
-		if ccVolumeMounts, ok := response.KafkaBrokerState.OnlineLogDirsByBrokerId[brokerId]; ok {
-			if !bcutil.AreStringSlicesIdentical(ccVolumeMounts, volumeMounts) {
-				return false, nil
+		if ccOnlineLogDirs, ok := response.KafkaBrokerState.OnlineLogDirsByBrokerId[brokerId]; ok {
+			for _, volumeMount := range volumeMounts {
+				match := false
+				for _, ccOnlineLogDir := range ccOnlineLogDirs {
+					match = strings.HasPrefix(strings.TrimSpace(ccOnlineLogDir), strings.TrimSpace(volumeMount))
+					break
+				}
+
+				if !match {
+					return false, nil
+				}
 			}
+
 		} else {
 			return false, nil
 		}

@@ -134,31 +134,33 @@ func (r *CruiseControlReconciler) Reconcile(request ctrl.Request) (ctrl.Result, 
 		}
 	}
 
+	var taskId, startTime string
 	if len(brokersWithUpscaleRequired) > 0 {
 		err = r.handlePodAddCCTask(instance, brokersWithUpscaleRequired, log)
 	} else if len(brokersWithDownscaleRequired) > 0 {
 		err = r.handlePodDeleteCCTask(instance, brokersWithDownscaleRequired, log)
 	} else if len(brokersWithDiskRebalanceRequired) > 0 {
 		// create new cc task, set status to running
-		taskId, startTime, err := scale.RebalanceDisks(brokersWithDiskRebalanceRequired, instance.Namespace, instance.Spec.CruiseControlConfig.CruiseControlEndpoint, instance.Name)
-
-		var brokerIds []string
-		brokersVolumeStates := make(map[string]map[string]v1beta1.VolumeState, len(brokersWithDiskRebalanceRequired))
-		for brokerId, mountPaths := range brokersWithDiskRebalanceRequired {
-			brokerIds = append(brokerIds, brokerId)
-			brokerVolumeState := make(map[string]v1beta1.VolumeState, len(mountPaths))
-			for _, mountPath := range mountPaths {
-				brokerVolumeState[mountPath] = kafkav1beta1.VolumeState{
-					CruiseControlTaskId:      taskId,
-					TaskStarted:              startTime,
-					CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRunning,
-				}
-			}
-
-		}
-		err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, instance, brokersVolumeStates, log)
+		taskId, startTime, err = scale.RebalanceDisks(brokersWithDiskRebalanceRequired, instance.Namespace, instance.Spec.CruiseControlConfig.CruiseControlEndpoint, instance.Name)
 		if err != nil {
-			return requeueWithError(log, err.Error(), err)
+			log.Error(err, "executing disk rebalance cc task failed")
+		} else {
+
+			var brokerIds []string
+			brokersVolumeStates := make(map[string]map[string]v1beta1.VolumeState, len(brokersWithDiskRebalanceRequired))
+			for brokerId, mountPaths := range brokersWithDiskRebalanceRequired {
+				brokerIds = append(brokerIds, brokerId)
+				brokerVolumeState := make(map[string]v1beta1.VolumeState, len(mountPaths))
+				for _, mountPath := range mountPaths {
+					brokerVolumeState[mountPath] = kafkav1beta1.VolumeState{
+						CruiseControlTaskId:      taskId,
+						TaskStarted:              startTime,
+						CruiseControlVolumeState: v1beta1.GracefulDiskRebalanceRunning,
+					}
+				}
+
+			}
+			err = k8sutil.UpdateBrokerStatus(r.Client, brokerIds, instance, brokersVolumeStates, log)
 		}
 	}
 
