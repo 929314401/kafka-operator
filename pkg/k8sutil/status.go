@@ -118,11 +118,17 @@ func generateBrokerState(brokerIds []string, cluster *banzaicloudv1beta1.KafkaCl
 			case banzaicloudv1beta1.ConfigurationState:
 				val.ConfigurationState = s
 			case map[string]banzaicloudv1beta1.VolumeState:
+				if val.GracefulActionState.VolumeStates == nil {
+					val.GracefulActionState.VolumeStates = make(map[string]banzaicloudv1beta1.VolumeState)
+				}
 				for mountPath, volumeState := range s {
 					val.GracefulActionState.VolumeStates[mountPath] = volumeState
 				}
 			case map[string]map[string]banzaicloudv1beta1.VolumeState:
 				state := s[brokerId]
+				if val.GracefulActionState.VolumeStates == nil {
+					val.GracefulActionState.VolumeStates = make(map[string]banzaicloudv1beta1.VolumeState)
+				}
 				for mountPath, volumeState := range state {
 					val.GracefulActionState.VolumeStates[mountPath] = volumeState
 				}
